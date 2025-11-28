@@ -496,12 +496,7 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         partial_video_length=113,
     ) -> Union[WanPipelineOutput, Tuple]:
         """
-        Function invoked when calling the pipeline for generation.
-
-Examples:
-    ```python
-    pass
-    ```
+        Function invoked when calling the pipeline for generation.\n\nExamples:\n    ```python\n    pass\n    ```
         """
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
