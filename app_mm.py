@@ -239,11 +239,12 @@ clip_image_encoder = CLIPModel.from_pretrained(
     ),
 ).to(config.weight_dtype).eval()
 
-# Put main models on the selected device & freeze grads
-transformer.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
-vae.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
-text_encoder.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
-clip_image_encoder.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
+# Put main models in eval mode and freeze grads.
+# IMPORTANT: do NOT move them all to GPU here – let mmgp handle placement.
+transformer.eval().requires_grad_(False)
+vae.eval().requires_grad_(False)
+text_encoder.eval().requires_grad_(False)
+clip_image_encoder.eval().requires_grad_(False)
 
 # Load scheduler
 scheduler_cls = {
@@ -255,7 +256,7 @@ scheduler = scheduler_cls(
     **filter_kwargs(scheduler_cls, OmegaConf.to_container(cfg["scheduler_kwargs"]))
 )
 
-# Create pipeline
+# Create pipeline (models still mostly on CPU; mmgp will place them)
 pipeline = WanFunInpaintAudioPipeline(
     transformer=transformer,
     vae=vae,
@@ -265,11 +266,23 @@ pipeline = WanFunInpaintAudioPipeline(
     clip_image_encoder=clip_image_encoder,
 )
 
-# Move pipeline to device & dtype
-pipeline.to(device)
-pipeline.to(dtype=config.weight_dtype)
+# Let mmgp decide GPU/CPU placement based on budget
+if torch.cuda.is_available():
+    total_mb = torch.cuda.get_device_properties(0).total_memory / 1048576
+    budgets = int(total_mb * args.max_vram)
+    print(f"Automatically setting maximum VRAM budget to {budgets} MB")
+    offload.profile(
+        pipeline,
+        profile_type.LowRAM_HighVRAM,
+        budgets={"*": budgets},
+        compile=True if args.compile else False,
+    )
+else:
+    budgets = 0
+    print("CUDA not available, running fully on CPU.")
 
-# Enable diffusers memory optimizations (safe with mmgp)
+# AFTER offload, enable diffusers memory optimizations.
+# These mostly change how the models run, not where they live.
 try:
     pipeline.enable_attention_slicing("max")
     print("Attention slicing enabled.")
@@ -288,7 +301,9 @@ try:
 except Exception as e:
     print(f"Could not enable VAE slicing: {e}")
 
-torch.cuda.empty_cache() if torch.cuda.is_available() else None
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
 
 budgets = int(
     torch.cuda.get_device_properties(0).total_memory / 1048576 * args.max_vram
