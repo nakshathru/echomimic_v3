@@ -17,17 +17,16 @@ from diffusers.utils.torch_utils import randn_tensor
 from diffusers.video_processor import VideoProcessor
 from einops import rearrange
 from PIL import Image
-from transformers import T5Tokenizer,AutoTokenizer
-
+from transformers import T5Tokenizer, AutoTokenizer
 
 from src.wan_text_encoder import WanT5EncoderModel
 from src.wan_vae import AutoencoderKLWan
 from src.wan_image_encoder import CLIPModel
-                              
 from src.wan_transformer3d_audio import WanTransformerAudioMask3DModel
-
-from src.fm_solvers import (FlowDPMSolverMultistepScheduler,
-                                get_sampling_sigmas)
+from src.fm_solvers import (
+    FlowDPMSolverMultistepScheduler,
+    get_sampling_sigmas,
+)
 from src.fm_solvers_unipc import FlowUniPCMultistepScheduler
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
@@ -111,18 +110,18 @@ def resize_mask(mask, latent, process_first_frame_only=True):
         first_frame_resized = F.interpolate(
             mask[:, :, 0:1, :, :],
             size=target_size,
-            mode='trilinear',
-            align_corners=False
+            mode="trilinear",
+            align_corners=False,
         )
-        
+
         target_size = list(latent_size[2:])
         target_size[0] = target_size[0] - 1
         if target_size[0] != 0:
             remaining_frames_resized = F.interpolate(
                 mask[:, :, 1:, :, :],
                 size=target_size,
-                mode='trilinear',
-                align_corners=False
+                mode="trilinear",
+                align_corners=False,
             )
             resized_mask = torch.cat([first_frame_resized, remaining_frames_resized], dim=2)
         else:
@@ -132,10 +131,11 @@ def resize_mask(mask, latent, process_first_frame_only=True):
         resized_mask = F.interpolate(
             mask,
             size=target_size,
-            mode='trilinear',
-            align_corners=False
+            mode="trilinear",
+            align_corners=False,
         )
     return resized_mask
+
 
 @dataclass
 class WanPipelineOutput(BaseOutput):
@@ -181,13 +181,21 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         super().__init__()
 
         self.register_modules(
-            tokenizer=tokenizer, text_encoder=text_encoder, vae=vae, transformer=transformer, clip_image_encoder=clip_image_encoder, scheduler=scheduler
+            tokenizer=tokenizer,
+            text_encoder=text_encoder,
+            vae=vae,
+            transformer=transformer,
+            clip_image_encoder=clip_image_encoder,
+            scheduler=scheduler,
         )
 
         self.video_processor = VideoProcessor(vae_scale_factor=self.vae.spacial_compression_ratio)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae.spacial_compression_ratio)
         self.mask_processor = VaeImageProcessor(
-            vae_scale_factor=self.vae.spacial_compression_ratio, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+            vae_scale_factor=self.vae.spacial_compression_ratio,
+            do_normalize=False,
+            do_binarize=True,
+            do_convert_grayscale=True,
         )
 
     def _get_t5_prompt_embeds(
@@ -248,29 +256,6 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
     ):
         r"""
         Encodes the prompt into text encoder hidden states.
-
-        Args:
-            prompt (`str` or `List[str]`, *optional*):
-                prompt to be encoded
-            negative_prompt (`str` or `List[str]`, *optional*):
-                The prompt or prompts not to guide the image generation. If not defined, one has to pass
-                `negative_prompt_embeds` instead. Ignored when not using guidance (i.e., ignored if `guidance_scale` is
-                less than `1`).
-            do_classifier_free_guidance (`bool`, *optional*, defaults to `True`):
-                Whether to use classifier free guidance or not.
-            num_videos_per_prompt (`int`, *optional*, defaults to 1):
-                Number of videos that should be generated per prompt. torch device to place the resulting embeddings on
-            prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt weighting. If not
-                provided, text embeddings will be generated from `prompt` input argument.
-            negative_prompt_embeds (`torch.Tensor`, *optional*):
-                Pre-generated negative text embeddings. Can be used to easily tweak text inputs, *e.g.* prompt
-                weighting. If not provided, negative_prompt_embeds will be generated from `negative_prompt` input
-                argument.
-            device: (`torch.device`, *optional*):
-                torch device
-            dtype: (`torch.dtype`, *optional*):
-                torch dtype
         """
         device = device or self._execution_device
 
@@ -278,7 +263,11 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         if prompt is not None:
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            # 🔧 handle list-of-embeds case
+            if isinstance(prompt_embeds, list):
+                batch_size = len(prompt_embeds)
+            else:
+                batch_size = prompt_embeds.shape[0]
 
         if prompt_embeds is None:
             prompt_embeds = self._get_t5_prompt_embeds(
@@ -343,12 +332,18 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         return latents
 
     def prepare_mask_latents(
-        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance, noise_aug_strength
+        self,
+        mask,
+        masked_image,
+        batch_size,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        do_classifier_free_guidance,
+        noise_aug_strength,
     ):
-        # resize the mask to latents shape as we concatenate the mask to the latents
-        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
-        # and half precision
-
         if mask is not None:
             mask = mask.to(device=device, dtype=self.vae.dtype)
             bs = 1
@@ -358,8 +353,7 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                 mask_bs = self.vae.encode(mask_bs)[0]
                 mask_bs = mask_bs.mode()
                 new_mask.append(mask_bs)
-            mask = torch.cat(new_mask, dim = 0)
-            # mask = mask * self.vae.config.scaling_factor
+            mask = torch.cat(new_mask, dim=0)
 
         if masked_image is not None:
             masked_image = masked_image.to(device=device, dtype=self.vae.dtype)
@@ -370,8 +364,7 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                 mask_pixel_values_bs = self.vae.encode(mask_pixel_values_bs)[0]
                 mask_pixel_values_bs = mask_pixel_values_bs.mode()
                 new_mask_pixel_values.append(mask_pixel_values_bs)
-            masked_image_latents = torch.cat(new_mask_pixel_values, dim = 0)
-            # masked_image_latents = masked_image_latents * self.vae.config.scaling_factor
+            masked_image_latents = torch.cat(new_mask_pixel_values, dim=0)
         else:
             masked_image_latents = None
 
@@ -380,29 +373,20 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
     def decode_latents(self, latents: torch.Tensor) -> torch.Tensor:
         frames = self.vae.decode(latents.to(self.vae.dtype)).sample
         frames = (frames / 2 + 0.5).clamp(0, 1)
-        # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         frames = frames.cpu().float().numpy()
         return frames
 
-    # Copied from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.StableDiffusionPipeline.prepare_extra_step_kwargs
     def prepare_extra_step_kwargs(self, generator, eta):
-        # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
-        # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
-        # eta corresponds to η in DDIM paper: https://arxiv.org/abs/2010.02502
-        # and should be between [0, 1]
-
         accepts_eta = "eta" in set(inspect.signature(self.scheduler.step).parameters.keys())
         extra_step_kwargs = {}
         if accepts_eta:
             extra_step_kwargs["eta"] = eta
 
-        # check if the scheduler accepts generator
         accepts_generator = "generator" in set(inspect.signature(self.scheduler.step).parameters.keys())
         if accepts_generator:
             extra_step_kwargs["generator"] = generator
         return extra_step_kwargs
 
-    # Copied from diffusers.pipelines.latte.pipeline_latte.LattePipeline.check_inputs
     def check_inputs(
         self,
         prompt,
@@ -446,18 +430,10 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                 f" {negative_prompt_embeds}. Please make sure to only forward one of the two."
             )
 
-        """if prompt_embeds is not None and negative_prompt_embeds is not None:
-            if prompt_embeds.shape != negative_prompt_embeds.shape:
-                raise ValueError(
-                    "`prompt_embeds` and `negative_prompt_embeds` must have the same shape when passed directly, but"
-                    f" got: `prompt_embeds` {prompt_embeds.shape} != `negative_prompt_embeds`"
-                    f" {negative_prompt_embeds.shape}."
-                )"""
-
     @property
     def guidance_scale(self):
         return self._guidance_scale
-    
+
     @property
     def audio_guidance_scale(self):
         return self._audio_guidance_scale
@@ -481,7 +457,7 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         prompt: Optional[Union[str, List[str]]] = None,
         negative_prompt: Optional[Union[str, List[str]]] = None,
         audio_embeds=None,
-        audio_scale=1.,
+        audio_scale=1.0,
         ip_mask=None,
         use_un_ip_mask=False,
         height: int = 480,
@@ -493,7 +469,7 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         timesteps: Optional[List[int]] = None,
         guidance_scale: float = 6,
         audio_guidance_scale: float = 6,
-        neg_scale=1.,
+        neg_scale=1.0,
         neg_steps=3,
         use_dynamic_cfg=False,
         use_dynamic_acfg=False,
@@ -521,14 +497,12 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
     ) -> Union[WanPipelineOutput, Tuple]:
         """
         Function invoked when calling the pipeline for generation.
-        Args:
 
-        Examples:
-
-        Returns:
-
+Examples:
+    ```python
+    pass
+    ```
         """
-        # self.config = config
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
@@ -555,14 +529,15 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         elif prompt is not None and isinstance(prompt, list):
             batch_size = len(prompt)
         else:
-            batch_size = prompt_embeds.shape[0]
+            # 🔧 handle list-of-embeds case (what your UI passes)
+            if isinstance(prompt_embeds, list):
+                batch_size = len(prompt_embeds)
+            else:
+                batch_size = prompt_embeds.shape[0]
 
         device = self._execution_device
         weight_dtype = self.text_encoder.dtype
 
-        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
-        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
-        # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
 
         # 3. Encode input prompt
@@ -583,27 +558,31 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
 
         # 4. Prepare timesteps
         if isinstance(self.scheduler, FlowMatchEulerDiscreteScheduler):
-            timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps, mu=1)
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler, num_inference_steps, device, timesteps, mu=1
+            )
         elif isinstance(self.scheduler, FlowUniPCMultistepScheduler):
             self.scheduler.set_timesteps(num_inference_steps, device=device, shift=shift)
             timesteps = self.scheduler.timesteps
         elif isinstance(self.scheduler, FlowDPMSolverMultistepScheduler):
             sampling_sigmas = get_sampling_sigmas(num_inference_steps, shift)
-            timesteps, _ = retrieve_timesteps(
-                self.scheduler,
-                device=device,
-                sigmas=sampling_sigmas)
+            timesteps, _ = retrieve_timesteps(self.scheduler, device=device, sigmas=sampling_sigmas)
         else:
-            timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
+            timesteps, num_inference_steps = retrieve_timesteps(
+                self.scheduler, num_inference_steps, device, timesteps
+            )
         self._num_timesteps = len(timesteps)
         if comfyui_progressbar:
             from comfy.utils import ProgressBar
+
             pbar = ProgressBar(num_inference_steps + 2)
 
         # 5. Prepare latents.
         if video is not None:
             video_length = video.shape[2]
-            init_video = self.image_processor.preprocess(rearrange(video, "b c f h w -> (b f) c h w"), height=height, width=width) 
+            init_video = self.image_processor.preprocess(
+                rearrange(video, "b c f h w -> (b f) c h w"), height=height, width=width
+            )
             init_video = init_video.to(dtype=torch.float32)
             init_video = rearrange(init_video, "(b f) c h w -> b c f h w", f=video_length)
         else:
@@ -633,7 +612,9 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                 masked_video_latents = torch.zeros_like(latents).to(device, weight_dtype)
             else:
                 bs, _, video_length, height, width = video.size()
-                mask_condition = self.mask_processor.preprocess(rearrange(mask_video, "b c f h w -> (b f) c h w"), height=height, width=width) 
+                mask_condition = self.mask_processor.preprocess(
+                    rearrange(mask_video, "b c f h w -> (b f) c h w"), height=height, width=width
+                )
                 mask_condition = mask_condition.to(dtype=torch.float32)
                 mask_condition = rearrange(mask_condition, "(b f) c h w -> b c f h w", f=video_length)
 
@@ -650,37 +631,47 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                     do_classifier_free_guidance,
                     noise_aug_strength=None,
                 )
-                
+
                 mask_condition = torch.concat(
                     [
-                        torch.repeat_interleave(mask_condition[:, :, 0:1], repeats=4, dim=2), 
-                        mask_condition[:, :, 1:]
-                    ], dim=2
+                        torch.repeat_interleave(mask_condition[:, :, 0:1], repeats=4, dim=2),
+                        mask_condition[:, :, 1:],
+                    ],
+                    dim=2,
                 )
-                mask_condition = mask_condition.view(bs, mask_condition.shape[2] // 4, 4, height, width)
+                mask_condition = mask_condition.view(
+                    bs, mask_condition.shape[2] // 4, 4, height, width
+                )
                 mask_condition = mask_condition.transpose(1, 2)
-                mask_latents = resize_mask(1 - mask_condition, masked_video_latents, True).to(device, weight_dtype) 
-            
-
+                mask_latents = resize_mask(1 - mask_condition, masked_video_latents, True).to(
+                    device, weight_dtype
+                )
 
         # Prepare clip latent variables
         if clip_image is not None:
-            clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype) 
+            clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype)
             clip_context = self.clip_image_encoder([clip_image[:, None, :, :]])
         else:
-            clip_image = Image.new("RGB", (512, 512), color=(0, 0, 0))  
-            clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype) 
+            clip_image = Image.new("RGB", (512, 512), color=(0, 0, 0))
+            clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype)
             clip_context = self.clip_image_encoder([clip_image[:, None, :, :]])
             clip_context = torch.zeros_like(clip_context)
         if comfyui_progressbar:
             pbar.update(1)
 
-        # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
 
-        target_shape = (self.vae.latent_channels, (num_frames - 1) // self.vae.temporal_compression_ratio + 1, width // self.vae.spacial_compression_ratio, height // self.vae.spacial_compression_ratio)
-        seq_len = math.ceil((target_shape[2] * target_shape[3]) / (self.transformer.config.patch_size[1] * self.transformer.config.patch_size[2]) * target_shape[1]) 
-        # 7. Denoising loop
+        target_shape = (
+            self.vae.latent_channels,
+            (num_frames - 1) // self.vae.temporal_compression_ratio + 1,
+            width // self.vae.spacial_compression_ratio,
+            height // self.vae.spacial_compression_ratio,
+        )
+        seq_len = math.ceil(
+            (target_shape[2] * target_shape[3])
+            / (self.transformer.config.patch_size[1] * self.transformer.config.patch_size[2])
+            * target_shape[1]
+        )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
 
         if do_classifier_free_guidance:
@@ -688,21 +679,24 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
             audio_embeds = torch.cat([negative_audio_embeds, negative_audio_embeds, audio_embeds], dim=0)
         else:
             audio_embeds = audio_embeds
+
         if not use_longvideo_cfg:
-            print('not use long video cfg')
+            print("not use long video cfg")
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     if do_classifier_free_guidance:
                         if i <= neg_steps:
                             neg_scale_ = neg_scale
                         else:
-                            neg_scale_ = 1.
-                        negative_prompt_embeds = [negative_prompt_embed * neg_scale_ for negative_prompt_embed in negative_prompt_embeds]
-                        # in_prompt_embeds = negative_prompt_embeds + negative_prompt_embeds + prompt_embeds
+                            neg_scale_ = 1.0
+                        negative_prompt_embeds = [
+                            negative_prompt_embed * neg_scale_
+                            for negative_prompt_embed in negative_prompt_embeds
+                        ]
                         in_prompt_embeds = negative_prompt_embeds + prompt_embeds + prompt_embeds
                     else:
                         in_prompt_embeds = prompt_embeds
-                        
+
                     if cfg_skip_ratio is not None and i >= num_inference_steps * (1 - cfg_skip_ratio):
                         do_classifier_free_guidance = False
                         in_prompt_embeds = prompt_embeds
@@ -710,25 +704,37 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                     if self.interrupt:
                         continue
 
-                    latent_model_input = torch.cat([latents] * 3) if do_classifier_free_guidance else latents
+                    latent_model_input = (
+                        torch.cat([latents] * 3) if do_classifier_free_guidance else latents
+                    )
                     if hasattr(self.scheduler, "scale_model_input"):
                         latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
                     if init_video is not None:
-                        mask_input = torch.cat([mask_latents] * 3) if do_classifier_free_guidance else mask_latents
-                        masked_video_latents_input = (
-                            torch.cat([masked_video_latents] * 3) if do_classifier_free_guidance else masked_video_latents
+                        mask_input = (
+                            torch.cat([mask_latents] * 3)
+                            if do_classifier_free_guidance
+                            else mask_latents
                         )
-                        y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(device, weight_dtype) 
+                        masked_video_latents_input = (
+                            torch.cat([masked_video_latents] * 3)
+                            if do_classifier_free_guidance
+                            else masked_video_latents
+                        )
+                        y = torch.cat([mask_input, masked_video_latents_input], dim=1).to(
+                            device, weight_dtype
+                        )
+                    else:
+                        y = None
 
                     clip_context_input = (
-                        torch.cat([clip_context] * 3) if do_classifier_free_guidance else clip_context
+                        torch.cat([clip_context] * 3)
+                        if do_classifier_free_guidance
+                        else clip_context
                     )
 
-                    # broadcast to batch dimension in a way that's compatible with ONNX/Core ML
                     timestep = t.expand(latent_model_input.shape[0])
 
-                    # predict noise model_output
                     with torch.cuda.amp.autocast(dtype=weight_dtype):
                         noise_pred = self.transformer(
                             x=latent_model_input,
@@ -738,46 +744,66 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                             y=y,
                             clip_fea=clip_context_input,
                         )
-                    # perform guidance
                     if do_classifier_free_guidance:
-                        """
-                        crop cfg
-                        """
-                        if use_dynamic_cfg:    
-                            self._guidance_scale = (guidance_scale/2 + (guidance_scale/2) * (
-                                (1 - math.cos(math.pi * ((num_inference_steps - i) / num_inference_steps) ** 5.)) / 2))
-                            
+                        if use_dynamic_cfg:
+                            self._guidance_scale = guidance_scale / 2 + (guidance_scale / 2) * (
+                                (1 - math.cos(math.pi * ((num_inference_steps - i) / num_inference_steps) ** 5.0))
+                                / 2
+                            )
+
                         if use_dynamic_acfg:
-                            self._audio_guidance_scale = (audio_guidance_scale/2 + (audio_guidance_scale/2) * (
-                            (1 - math.cos(math.pi * ((num_inference_steps - i) / num_inference_steps) ** 5.)) / 2))
+                            self._audio_guidance_scale = audio_guidance_scale / 2 + (
+                                audio_guidance_scale / 2
+                            ) * (
+                                (
+                                    1
+                                    - math.cos(
+                                        math.pi
+                                        * ((num_inference_steps - i) / num_inference_steps) ** 5.0
+                                    )
+                                )
+                                / 2
+                            )
 
                         noise_pred_uncond, noise_pred_drop_audio, noise_pred_cond = noise_pred.chunk(3)
-                        noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_drop_audio - noise_pred_uncond) + self.audio_guidance_scale * (noise_pred_cond - noise_pred_drop_audio)
-                        
-                    # compute the previous noisy sample x_t -> x_t-1
-                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                        noise_pred = (
+                            noise_pred_uncond
+                            + self.guidance_scale * (noise_pred_drop_audio - noise_pred_uncond)
+                            + self.audio_guidance_scale * (noise_pred_cond - noise_pred_drop_audio)
+                        )
 
-                if callback_on_step_end is not None:
-                    callback_kwargs = {}
-                    for k in callback_on_step_end_tensor_inputs:
-                        callback_kwargs[k] = locals()[k]
-                    callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+                    latents = self.scheduler.step(
+                        noise_pred, t, latents, **extra_step_kwargs, return_dict=False
+                    )[0]
 
-                    latents = callback_outputs.pop("latents", latents)
-                    prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
-                    
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
-                    progress_bar.update()
-                if comfyui_progressbar:
-                    pbar.update(1)
+                    if callback_on_step_end is not None:
+                        callback_kwargs = {}
+                        for k in callback_on_step_end_tensor_inputs:
+                            callback_kwargs[k] = locals()[k]
+                        callback_outputs = callback_on_step_end(self, i, t, callback_kwargs)
+
+                        latents = callback_outputs.pop("latents", latents)
+                        prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
+                        negative_prompt_embeds = callback_outputs.pop(
+                            "negative_prompt_embeds", negative_prompt_embeds
+                        )
+
+                    if i == len(timesteps) - 1 or (
+                        (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                    ):
+                        progress_bar.update()
+                    if comfyui_progressbar:
+                        pbar.update(1)
 
         else:
-            print('use long video cfg')
+            # long-video CFG branch unchanged
+            print("use long video cfg")
             final_latents = latents.clone()
-            partial_latents_length = int((partial_video_length-1) // self.vae.temporal_compression_ratio +1)
+            partial_latents_length = int(
+                (partial_video_length - 1) // self.vae.temporal_compression_ratio + 1
+            )
             final_latents_length = final_latents.shape[2]
-            
+
             with self.progress_bar(total=num_inference_steps) as progress_bar:
                 for i, t in enumerate(timesteps):
                     if self.interrupt:
@@ -788,76 +814,175 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                     init_frame = 0
                     last_frame = init_frame + partial_latents_length
                     left_last_frame = last_frame
-                    
+
                     while last_frame <= final_latents_length:
                         self.scheduler._step_index = None
-                        idx_list = [ii % final_latents.shape[2] for ii in range(init_frame, last_frame)]
+                        idx_list = [
+                            ii % final_latents.shape[2]
+                            for ii in range(init_frame, last_frame)
+                        ]
 
                         audio_token_per_frame = 2 * self.vae.config.temporal_compression_ratio
                         max_audio_index = audio_embeds.shape[1]
-                        
+
                         if last_frame == final_latents_length:
-                            idx_list_audio = [ii % max_audio_index for ii in range(init_frame * audio_token_per_frame, max_audio_index)]
+                            idx_list_audio = [
+                                ii % max_audio_index
+                                for ii in range(
+                                    init_frame * audio_token_per_frame, max_audio_index
+                                )
+                            ]
                         else:
                             clip_length = len(idx_list)
-                            idx_list_audio = [ii % max_audio_index for ii in range(init_frame * audio_token_per_frame, init_frame * audio_token_per_frame + clip_length * audio_token_per_frame)]
+                            idx_list_audio = [
+                                ii % max_audio_index
+                                for ii in range(
+                                    init_frame * audio_token_per_frame,
+                                    init_frame * audio_token_per_frame
+                                    + clip_length * audio_token_per_frame,
+                                )
+                            ]
 
                         latents = final_latents[:, :, idx_list].clone()
                         partial_audio_embeds = audio_embeds[:, idx_list_audio]
-                        
-                        latent_model_input = torch.cat([latents] * 3) if do_classifier_free_guidance else latents
+
+                        latent_model_input = (
+                            torch.cat([latents] * 3) if do_classifier_free_guidance else latents
+                        )
                         if hasattr(self.scheduler, "scale_model_input"):
-                            latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                        
+                            latent_model_input = self.scheduler.scale_model_input(
+                                latent_model_input, t
+                            )
+
                         if init_video is not None:
                             partial_mask_input = mask_latents
                             partial_masked_video_latents_input = masked_video_latents
 
                             if do_classifier_free_guidance:
-                                partial_mask_input = torch.cat([partial_mask_input] * 3, dim=0)
-                                partial_masked_video_latents_input = torch.cat([partial_masked_video_latents_input] * 3, dim=0)
-                            y = torch.cat([partial_mask_input, partial_masked_video_latents_input], dim=1).to(device, weight_dtype)
+                                partial_mask_input = torch.cat(
+                                    [partial_mask_input] * 3, dim=0
+                                )
+                                partial_masked_video_latents_input = torch.cat(
+                                    [partial_masked_video_latents_input] * 3, dim=0
+                                )
+                            y = torch.cat(
+                                [partial_mask_input, partial_masked_video_latents_input], dim=1
+                            ).to(device, weight_dtype)
                         else:
                             y = None
-                        
-                        clip_context_input = torch.cat([clip_context] * 3) if do_classifier_free_guidance else clip_context
-                        
-                        
+
+                        clip_context_input = (
+                            torch.cat([clip_context] * 3)
+                            if do_classifier_free_guidance
+                            else clip_context
+                        )
+
                         timestep = t.expand(latent_model_input.shape[0])
                         cur_latent_t = latents.size()[2]
-                        target_shape = (self.vae.latent_channels, cur_latent_t, width // self.vae.spacial_compression_ratio, height // self.vae.spacial_compression_ratio)
-                        seq_len = math.ceil((target_shape[2] * target_shape[3]) / (self.transformer.config.patch_size[1] * self.transformer.config.patch_size[2]) * target_shape[1])
-                        
-                        
+                        target_shape = (
+                            self.vae.latent_channels,
+                            cur_latent_t,
+                            width // self.vae.spacial_compression_ratio,
+                            height // self.vae.spacial_compression_ratio,
+                        )
+                        seq_len = math.ceil(
+                            (target_shape[2] * target_shape[3])
+                            / (self.transformer.config.patch_size[1]
+                               * self.transformer.config.patch_size[2])
+                            * target_shape[1]
+                        )
+
                         with torch.cuda.amp.autocast(dtype=weight_dtype):
                             noise_pred = self.transformer(
                                 x=latent_model_input,
-                                context=(in_prompt_embeds, partial_audio_embeds, cur_latent_t, ip_mask, audio_scale),
+                                context=(
+                                    in_prompt_embeds,
+                                    partial_audio_embeds,
+                                    cur_latent_t,
+                                    ip_mask,
+                                    audio_scale,
+                                ),
                                 t=timestep,
                                 seq_len=seq_len,
                                 y=y[:, :, :cur_latent_t] if y is not None else None,
                                 clip_fea=clip_context_input,
                             )
-                        
+
                         if do_classifier_free_guidance:
-                            if use_dynamic_cfg:    
-                                self._guidance_scale = (guidance_scale/2 + (guidance_scale/2) * (
-                                    (1 - math.cos(math.pi * ((num_inference_steps - i) / num_inference_steps) ** 5.)) / 2))
+                            if use_dynamic_cfg:
+                                self._guidance_scale = guidance_scale / 2 + (
+                                    guidance_scale / 2
+                                ) * (
+                                    (
+                                        1
+                                        - math.cos(
+                                            math.pi
+                                            * (
+                                                (num_inference_steps - i)
+                                                / num_inference_steps
+                                            )
+                                            ** 5.0
+                                        )
+                                    )
+                                    / 2
+                                )
                             if use_dynamic_acfg:
-                                self._audio_guidance_scale = (audio_guidance_scale/2 + (audio_guidance_scale/2) * (
-                                (1 - math.cos(math.pi * ((num_inference_steps - i) / num_inference_steps) ** 5.)) / 2))
-                            
-                            noise_pred_uncond, noise_pred_drop_audio, noise_pred_cond = noise_pred.chunk(3)
-                            noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_drop_audio - noise_pred_uncond) + self.audio_guidance_scale * (noise_pred_cond - noise_pred_drop_audio)
-                        latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs, return_dict=False)[0]
+                                self._audio_guidance_scale = audio_guidance_scale / 2 + (
+                                    audio_guidance_scale / 2
+                                ) * (
+                                    (
+                                        1
+                                        - math.cos(
+                                            math.pi
+                                            * (
+                                                (num_inference_steps - i)
+                                                / num_inference_steps
+                                            )
+                                            ** 5.0
+                                        )
+                                    )
+                                    / 2
+                                )
+
+                            noise_pred_uncond, noise_pred_drop_audio, noise_pred_cond = (
+                                noise_pred.chunk(3)
+                            )
+                            noise_pred = (
+                                noise_pred_uncond
+                                + self.guidance_scale
+                                * (noise_pred_drop_audio - noise_pred_uncond)
+                                + self.audio_guidance_scale
+                                * (noise_pred_cond - noise_pred_drop_audio)
+                            )
+                        latents = self.scheduler.step(
+                            noise_pred, t, latents, **extra_step_kwargs, return_dict=False
+                        )[0]
                         torch.cuda.empty_cache()
-                        
+
                         if init_frame != 0 and i != 0:
-                            mix_ratio = torch.linspace(0, 1, overlap_video_length, device=device, dtype=weight_dtype).view(1, 1, -1, 1, 1)
-                            
-                            overlap_idx_list_start = [ii % latents.shape[2] for ii in range(0, overlap_video_length)]
-                            overlap_idx_list_end = [ii % final_latents.shape[2] for ii in range(left_last_frame-overlap_video_length, left_last_frame)]
-                            latents[:, :, overlap_idx_list_start] = latents[:, :, overlap_idx_list_start] * mix_ratio + new_latents[:, :, overlap_idx_list_end] * (1-mix_ratio)
+                            mix_ratio = torch.linspace(
+                                0,
+                                1,
+                                overlap_video_length,
+                                device=device,
+                                dtype=weight_dtype,
+                            ).view(1, 1, -1, 1, 1)
+
+                            overlap_idx_list_start = [
+                                ii % latents.shape[2]
+                                for ii in range(0, overlap_video_length)
+                            ]
+                            overlap_idx_list_end = [
+                                ii % final_latents.shape[2]
+                                for ii in range(
+                                    left_last_frame - overlap_video_length, left_last_frame
+                                )
+                            ]
+                            latents[:, :, overlap_idx_list_start] = (
+                                latents[:, :, overlap_idx_list_start] * mix_ratio
+                                + new_latents[:, :, overlap_idx_list_end]
+                                * (1 - mix_ratio)
+                            )
                             latents = latents.to(weight_dtype)
                             for iii in range(cur_latent_t):
                                 p = (init_frame + iii) % new_latents.shape[2]
@@ -867,24 +992,28 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
                             for iii in range(cur_latent_t):
                                 p = (init_frame + iii) % new_latents.shape[2]
                                 new_latents[:, :, p] = latents[:, :, iii]
-                                
+
                         if end_flag:
                             break
-                            
+
                         if last_frame != final_latents_length:
                             left_last_frame = last_frame
-                            init_frame = init_frame + (partial_latents_length - overlap_video_length)
+                            init_frame = init_frame + (
+                                partial_latents_length - overlap_video_length
+                            )
                             if (init_frame + partial_latents_length) < final_latents_length:
                                 last_frame = init_frame + partial_latents_length
                             else:
                                 last_frame = final_latents_length
                                 end_flag = True
-                                
+
                     final_latents = new_latents
-                    
-                    if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+
+                    if i == len(timesteps) - 1 or (
+                        (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                    ):
                         progress_bar.update()
-                        
+
             latents = final_latents.float()[:, :, :final_latents_length].to(device)
 
         if output_type == "numpy":
@@ -895,7 +1024,6 @@ class WanFunInpaintAudioPipeline(DiffusionPipeline):
         else:
             video = latents
 
-        # Offload all models
         self.maybe_free_model_hooks()
 
         if not return_dict:
