@@ -638,7 +638,7 @@ if __name__ == "__main__":
     demo.launch(
         server_name=args.server_name,
         server_port=args.server_port,
-        share=args.share,
+        share=True,
         mcp_server=args.mcp_server,
-        inbrowser=True,
+        inbrowser=False,
     )
