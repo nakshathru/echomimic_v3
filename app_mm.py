@@ -18,13 +18,16 @@ from transformers import AutoTokenizer, Wav2Vec2Model, Wav2Vec2Processor
 from moviepy import VideoFileClip, AudioFileClip
 import librosa
 
+# Hint to CUDA allocator to reduce fragmentation and allow expansion
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 # Custom modules
 from diffusers import FlowMatchEulerDiscreteScheduler
 
 from src.dist import set_multi_gpus_devices
 from src.wan_vae import AutoencoderKLWan
-from src.wan_image_encoder import  CLIPModel
-from src.wan_text_encoder import  WanT5EncoderModel
+from src.wan_image_encoder import CLIPModel
+from src.wan_text_encoder import WanT5EncoderModel
 from src.wan_transformer3d_audio import WanTransformerAudioMask3DModel
 from src.pipeline_wan_fun_inpaint_audio import WanFunInpaintAudioPipeline
 
@@ -45,23 +48,34 @@ import gradio as gr
 import random
 import gc
 
-parser = argparse.ArgumentParser() 
-parser.add_argument("--server_name", type=str, default="127.0.0.1", help="IP地址，局域网访问改为0.0.0.0")
-parser.add_argument("--server_port", type=int, default=7891, help="使用端口")
-parser.add_argument("--share", action="store_true", help="是否启用gradio共享")
-parser.add_argument("--mcp_server", action="store_true", help="是否启用mcp服务")
-parser.add_argument("--max_vram", type=float, default=0.9, help="占用显存最大比例")
-parser.add_argument("--compile", action="store_true", help="是否启用compile加速")
+parser = argparse.ArgumentParser()
+parser.add_argument("--server_name", type=str, default="127.0.0.1",
+                    help="Server IP address (use 0.0.0.0 for LAN access)")
+parser.add_argument("--server_port", type=int, default=7891,
+                    help="Port to serve the Gradio app on")
+parser.add_argument("--share", action="store_true",
+                    help="Enable Gradio public sharing")
+parser.add_argument("--mcp_server", action="store_true",
+                    help="Enable MCP server")
+parser.add_argument(
+    "--max_vram",
+    type=float,
+    default=0.9,
+    help="Maximum fraction of GPU VRAM to use (0.0–1.0)",
+)
+parser.add_argument("--compile", action="store_true",
+                    help="Enable torch.compile acceleration (if supported)")
 args = parser.parse_args()
 
 if torch.cuda.is_available():
-    device = "cuda" 
+    device = "cuda"
     if torch.cuda.get_device_capability()[0] >= 8:
         dtype = torch.bfloat16
     else:
         dtype = torch.float16
 else:
     device = "cpu"
+    dtype = torch.float32
 
 
 # --------------------- Configuration ---------------------
@@ -95,8 +109,8 @@ class Config:
         self.overlap_video_length = 8
         self.neg_scale = 1.5
         self.neg_steps = 2
-        self.guidance_scale = 4.5 #4.0 ~ 6.0
-        self.audio_guidance_scale = 2.5 #2.0 ~ 3.0
+        self.guidance_scale = 4.5  # 4.0 ~ 6.0
+        self.audio_guidance_scale = 2.5  # 2.0 ~ 3.0
         self.use_dynamic_cfg = True
         self.use_dynamic_acfg = True
         self.num_inference_steps = 20
@@ -113,9 +127,13 @@ class Config:
 
 # --------------------- Helper Functions ---------------------
 def load_wav2vec_models(wav2vec_model_dir):
-    """Load Wav2Vec models for audio feature extraction."""
+    """Load Wav2Vec models for audio feature extraction.
+
+    To save GPU memory on Colab, we keep the model on CPU.
+    """
     processor = Wav2Vec2Processor.from_pretrained(wav2vec_model_dir)
-    model = Wav2Vec2Model.from_pretrained(wav2vec_model_dir).eval().to("cuda")
+    # Keep Wav2Vec on CPU to avoid occupying GPU VRAM
+    model = Wav2Vec2Model.from_pretrained(wav2vec_model_dir).eval().to("cpu")
     model.requires_grad_(False)
     return processor, model
 
@@ -124,9 +142,12 @@ def extract_audio_features(audio_path, processor, model):
     """Extract audio features using Wav2Vec."""
     sr = 16000
     audio_segment, sample_rate = librosa.load(audio_path, sr=sr)
-    input_values = processor(audio_segment, sampling_rate=sample_rate, return_tensors="pt").input_values
+    input_values = processor(
+        audio_segment, sampling_rate=sample_rate, return_tensors="pt"
+    ).input_values
     input_values = input_values.to(model.device)
-    features = model(input_values).last_hidden_state
+    with torch.no_grad():
+        features = model(input_values).last_hidden_state
     return features.squeeze(0)
 
 
@@ -149,9 +170,11 @@ def get_sample_size(image, default_size):
 
 def get_ip_mask(coords):
     y1, y2, x1, x2, h, w = coords
-    Y, X = torch.meshgrid(torch.arange(h), torch.arange(w), indexing='ij')
-    mask = (Y.unsqueeze(-1) >= y1) & (Y.unsqueeze(-1) < y2) & (X.unsqueeze(-1) >= x1) & (X.unsqueeze(-1) < x2)
-    
+    Y, X = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
+    mask = (Y.unsqueeze(-1) >= y1) & (Y.unsqueeze(-1) < y2) & (X.unsqueeze(-1) >= x1) & (
+        X.unsqueeze(-1) < x2
+    )
+
     mask = mask.reshape(-1)
     return mask.float()
 
@@ -159,7 +182,7 @@ def get_ip_mask(coords):
 # Initialize configuration
 config = Config()
 
-# Set up multi-GPU devices
+# Set up multi-GPU devices (or single GPU)
 device = set_multi_gpus_devices(config.ulysses_degree, config.ring_degree)
 
 # Load configuration file
@@ -167,13 +190,21 @@ cfg = OmegaConf.load(config.config_path)
 
 # Load models
 transformer = WanTransformerAudioMask3DModel.from_pretrained(
-    os.path.join(config.model_name, cfg['transformer_additional_kwargs'].get('transformer_subpath', 'transformer')),
-    transformer_additional_kwargs=OmegaConf.to_container(cfg['transformer_additional_kwargs']),
+    os.path.join(
+        config.model_name,
+        cfg["transformer_additional_kwargs"].get(
+            "transformer_subpath", "transformer"
+        ),
+    ),
+    transformer_additional_kwargs=OmegaConf.to_container(
+        cfg["transformer_additional_kwargs"]
+    ),
     torch_dtype=config.weight_dtype,
 )
 if config.transformer_path is not None:
     if config.transformer_path.endswith("safetensors"):
-        from safetensors.torch import load_file, safe_open
+        from safetensors.torch import load_file
+
         state_dict = load_file(config.transformer_path)
     else:
         state_dict = torch.load(config.transformer_path)
@@ -182,23 +213,37 @@ if config.transformer_path is not None:
     print(f"Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
 
 vae = AutoencoderKLWan.from_pretrained(
-    os.path.join(config.model_name, cfg['vae_kwargs'].get('vae_subpath', 'vae')),
-    additional_kwargs=OmegaConf.to_container(cfg['vae_kwargs']),
+    os.path.join(config.model_name, cfg["vae_kwargs"].get("vae_subpath", "vae")),
+    additional_kwargs=OmegaConf.to_container(cfg["vae_kwargs"]),
 ).to(config.weight_dtype)
 
 tokenizer = AutoTokenizer.from_pretrained(
-    os.path.join(config.model_name, cfg['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
+    os.path.join(
+        config.model_name, cfg["text_encoder_kwargs"].get("tokenizer_subpath", "tokenizer")
+    ),
 )
 
 text_encoder = WanT5EncoderModel.from_pretrained(
-    os.path.join(config.model_name, cfg['text_encoder_kwargs'].get('text_encoder_subpath', 'text_encoder')),
-    additional_kwargs=OmegaConf.to_container(cfg['text_encoder_kwargs']),
+    os.path.join(
+        config.model_name,
+        cfg["text_encoder_kwargs"].get("text_encoder_subpath", "text_encoder"),
+    ),
+    additional_kwargs=OmegaConf.to_container(cfg["text_encoder_kwargs"]),
     torch_dtype=config.weight_dtype,
 ).eval()
 
 clip_image_encoder = CLIPModel.from_pretrained(
-    os.path.join(config.model_name, cfg['image_encoder_kwargs'].get('image_encoder_subpath', 'image_encoder')),
+    os.path.join(
+        config.model_name,
+        cfg["image_encoder_kwargs"].get("image_encoder_subpath", "image_encoder"),
+    ),
 ).to(config.weight_dtype).eval()
+
+# Put main models on the selected device & freeze grads
+transformer.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
+vae.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
+text_encoder.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
+clip_image_encoder.to(device=device, dtype=config.weight_dtype).eval().requires_grad_(False)
 
 # Load scheduler
 scheduler_cls = {
@@ -206,7 +251,9 @@ scheduler_cls = {
     "Flow_Unipc": FlowUniPCMultistepScheduler,
     "Flow_DPM++": FlowDPMSolverMultistepScheduler,
 }[config.sampler_name]
-scheduler = scheduler_cls(**filter_kwargs(scheduler_cls, OmegaConf.to_container(cfg['scheduler_kwargs'])))
+scheduler = scheduler_cls(
+    **filter_kwargs(scheduler_cls, OmegaConf.to_container(cfg["scheduler_kwargs"]))
+)
 
 # Create pipeline
 pipeline = WanFunInpaintAudioPipeline(
@@ -217,24 +264,56 @@ pipeline = WanFunInpaintAudioPipeline(
     scheduler=scheduler,
     clip_image_encoder=clip_image_encoder,
 )
-budgets = int(torch.cuda.get_device_properties(0).total_memory/1048576 * args.max_vram)
-print(f"自动调整最大显存占用为{budgets}MB")
-offload.profile(
-    pipeline, 
-    profile_type.LowRAM_HighVRAM, 
-    budgets={'*':budgets}, 
-    compile=True if args.compile else False,
-)
+
+# Move pipeline to device & dtype
+pipeline.to(device)
+pipeline.to(dtype=config.weight_dtype)
+
+# Enable diffusers memory optimizations (safe with mmgp)
+try:
+    pipeline.enable_attention_slicing("max")
+    print("Attention slicing enabled.")
+except Exception as e:
+    print(f"Could not enable attention slicing: {e}")
+
+try:
+    pipeline.enable_vae_tiling()
+    print("VAE tiling enabled.")
+except Exception as e:
+    print(f"Could not enable VAE tiling: {e}")
+
+try:
+    pipeline.enable_vae_slicing()
+    print("VAE slicing enabled.")
+except Exception as e:
+    print(f"Could not enable VAE slicing: {e}")
+
+torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+budgets = int(
+    torch.cuda.get_device_properties(0).total_memory / 1048576 * args.max_vram
+) if torch.cuda.is_available() else 0
+if torch.cuda.is_available():
+    print(f"Automatically setting maximum VRAM budget to {budgets} MB")
+    offload.profile(
+        pipeline,
+        profile_type.LowRAM_HighVRAM,
+        budgets={"*": budgets},
+        compile=True if args.compile else False,
+    )
 
 # Enable TeaCache if required
 if config.enable_teacache:
     coefficients = get_teacache_coefficients(config.model_name)
     pipeline.transformer.enable_teacache(
-        coefficients, config.num_inference_steps, config.teacache_threshold,
-        num_skip_start_steps=config.num_skip_start_steps, offload=config.teacache_offload
+        coefficients,
+        config.num_inference_steps,
+        config.teacache_threshold,
+        num_skip_start_steps=config.num_skip_start_steps,
+        offload=config.teacache_offload,
     )
 
-# Load Wav2Vec models
+# Load Wav2Vec models (kept on CPU)
 wav2vec_processor, wav2vec_model = load_wav2vec_models(config.wav2vec_model_dir)
 
 
@@ -246,12 +325,12 @@ def generate(
     partial_video_length,
     guidance_scale,
     audio_guidance_scale,
-    seed_param
+    seed_param,
 ):
-    if seed_param<0:
+    if seed_param < 0:
         seed = random.randint(0, np.iinfo(np.int32).max)
     else:
-        seed = seed_param
+        seed = int(seed_param)
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     save_path = "outputs"
     os.makedirs(save_path, exist_ok=True)
@@ -264,7 +343,7 @@ def generate(
 
     y1, y2, x1, x2, h_, w_ = get_mask_coord(image)
 
-    # Extract audio features
+    # Extract audio features (Wav2Vec on CPU, then features moved to GPU)
     audio_clip = AudioFileClip(audio)
     audio_features = extract_audio_features(audio, wav2vec_processor, wav2vec_model)
     audio_embeds = audio_features.unsqueeze(0).to(device=device, dtype=config.weight_dtype)
@@ -272,90 +351,141 @@ def generate(
     # Calculate video length and latent frames
     video_length = int(audio_clip.duration * config.fps)
     video_length = (
-        int((video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1
-        if video_length != 1 else 1
+        int(
+            (video_length - 1)
+            // vae.config.temporal_compression_ratio
+            * vae.config.temporal_compression_ratio
+        )
+        + 1
+        if video_length != 1
+        else 1
     )
     latent_frames = (video_length - 1) // vae.config.temporal_compression_ratio + 1
 
     if config.enable_riflex:
-        pipeline.transformer.enable_riflex(k = config.riflex_k, L_test = latent_frames)
+        pipeline.transformer.enable_riflex(k=config.riflex_k, L_test=latent_frames)
 
     # Adjust sample size and create IP mask
     sample_height, sample_width = get_sample_size(ref_img, config.sample_size)
     downratio = math.sqrt(sample_height * sample_width / h_ / w_)
     coords = (
-        y1 * downratio // 16, y2 * downratio // 16,
-        x1 * downratio // 16, x2 * downratio // 16,
-        sample_height // 16, sample_width // 16,
+        y1 * downratio // 16,
+        y2 * downratio // 16,
+        x1 * downratio // 16,
+        x2 * downratio // 16,
+        sample_height // 16,
+        sample_width // 16,
     )
     ip_mask = get_ip_mask(coords).unsqueeze(0)
-    ip_mask = torch.cat([ip_mask]*3).to(device=device, dtype=config.weight_dtype)
+    ip_mask = torch.cat([ip_mask] * 3).to(device=device, dtype=config.weight_dtype)
 
-    partial_video_length = int((partial_video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1 if video_length != 1 else 1
+    partial_video_length = (
+        int(
+            (partial_video_length - 1)
+            // vae.config.temporal_compression_ratio
+            * vae.config.temporal_compression_ratio
+        )
+        + 1
+        if video_length != 1
+        else 1
+    )
     latent_frames = (partial_video_length - 1) // vae.config.temporal_compression_ratio + 1
 
     # get clip image
-    _, _, clip_image = get_image_to_video_latent3(ref_img, None, video_length=partial_video_length, sample_size=[sample_height, sample_width])
+    _, _, clip_image = get_image_to_video_latent3(
+        ref_img,
+        None,
+        video_length=partial_video_length,
+        sample_size=[sample_height, sample_width],
+    )
 
     # Generate video in chunks
     init_frames = 0
     last_frames = init_frames + partial_video_length
     new_sample = None
 
-    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(prompt, negative_prompt, dtype=dtype)
-    
+    prompt_embeds, negative_prompt_embeds = pipeline.encode_prompt(
+        prompt, negative_prompt, dtype=dtype
+    )
+
     while init_frames < video_length:
         if last_frames >= video_length:
             partial_video_length = video_length - init_frames
             partial_video_length = (
-                int((partial_video_length - 1) // vae.config.temporal_compression_ratio * vae.config.temporal_compression_ratio) + 1
-                if video_length != 1 else 1
+                int(
+                    (partial_video_length - 1)
+                    // vae.config.temporal_compression_ratio
+                    * vae.config.temporal_compression_ratio
+                )
+                + 1
+                if video_length != 1
+                else 1
             )
-            latent_frames = (partial_video_length - 1) // vae.config.temporal_compression_ratio + 1
+            latent_frames = (
+                (partial_video_length - 1) // vae.config.temporal_compression_ratio + 1
+            )
 
             if partial_video_length <= 0:
                 break
 
         input_video, input_video_mask, _ = get_image_to_video_latent3(
-            ref_img, None, video_length=partial_video_length, sample_size=[sample_height, sample_width]
+            ref_img,
+            None,
+            video_length=partial_video_length,
+            sample_size=[sample_height, sample_width],
         )
 
-        partial_audio_embeds = audio_embeds[:, init_frames * 2 : (init_frames + partial_video_length) * 2]
-        # video_length = init_frames + partial_video_length
+        partial_audio_embeds = audio_embeds[
+            :, init_frames * 2 : (init_frames + partial_video_length) * 2
+        ]
 
         sample = pipeline(
-            prompt_embeds         = prompt_embeds, 
-            negative_prompt_embeds= negative_prompt_embeds,
-            num_frames            = partial_video_length,
-            audio_embeds          = partial_audio_embeds,
-            audio_scale           = config.audio_scale,
-            ip_mask               = ip_mask,
-            use_un_ip_mask        = config.use_un_ip_mask,
-            height                = sample_height,
-            width                 = sample_width,
-            generator             = generator,
-            neg_scale             = config.neg_scale,
-            neg_steps             = config.neg_steps,
-            use_dynamic_cfg       = config.use_dynamic_cfg,
-            use_dynamic_acfg      = config.use_dynamic_acfg,
-            guidance_scale        = guidance_scale,
-            audio_guidance_scale  = audio_guidance_scale,
-            num_inference_steps   = config.num_inference_steps,
-            video                 = input_video,
-            mask_video            = input_video_mask,
-            clip_image            = clip_image,
-            cfg_skip_ratio        = config.cfg_skip_ratio,
-            shift                 = config.shift,
+            prompt_embeds=prompt_embeds,
+            negative_prompt_embeds=negative_prompt_embeds,
+            num_frames=partial_video_length,
+            audio_embeds=partial_audio_embeds,
+            audio_scale=config.audio_scale,
+            ip_mask=ip_mask,
+            use_un_ip_mask=config.use_un_ip_mask,
+            height=sample_height,
+            width=sample_width,
+            generator=generator,
+            neg_scale=config.neg_scale,
+            neg_steps=config.neg_steps,
+            use_dynamic_cfg=config.use_dynamic_cfg,
+            use_dynamic_acfg=config.use_dynamic_acfg,
+            guidance_scale=guidance_scale,
+            audio_guidance_scale=audio_guidance_scale,
+            num_inference_steps=config.num_inference_steps,
+            video=input_video,
+            mask_video=input_video_mask,
+            clip_image=clip_image,
+            cfg_skip_ratio=config.cfg_skip_ratio,
+            shift=config.shift,
         ).videos
         if init_frames != 0:
-            mix_ratio = torch.from_numpy(
-                np.array([float(i) / float(config.overlap_video_length) for i in range(config.overlap_video_length)], np.float32)
-            ).unsqueeze(0).unsqueeze(0).unsqueeze(-1).unsqueeze(-1)
-            new_sample[:, :, -config.overlap_video_length:] = (
-                new_sample[:, :, -config.overlap_video_length:] * (1 - mix_ratio) +
-                sample[:, :, :config.overlap_video_length] * mix_ratio
+            mix_ratio = (
+                torch.from_numpy(
+                    np.array(
+                        [
+                            float(i) / float(config.overlap_video_length)
+                            for i in range(config.overlap_video_length)
+                        ],
+                        np.float32,
+                    )
+                )
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .unsqueeze(-1)
+                .unsqueeze(-1)
             )
-            new_sample = torch.cat([new_sample, sample[:, :, config.overlap_video_length:]], dim=2)
+            new_sample[:, :, -config.overlap_video_length :] = (
+                new_sample[:, :, -config.overlap_video_length :] * (1 - mix_ratio)
+                + sample[:, :, : config.overlap_video_length] * mix_ratio
+            )
+            new_sample = torch.cat(
+                [new_sample, sample[:, :, config.overlap_video_length :]], dim=2
+            )
             sample = new_sample
         else:
             new_sample = sample
@@ -365,27 +495,38 @@ def generate(
 
         ref_img = [
             Image.fromarray(
-                (sample[0, :, i].transpose(0, 1).transpose(1, 2) * 255).numpy().astype(np.uint8)
-            ) for i in range(-config.overlap_video_length, 0)
+                (sample[0, :, i].transpose(0, 1).transpose(1, 2) * 255)
+                .numpy()
+                .astype(np.uint8)
+            )
+            for i in range(-config.overlap_video_length, 0)
         ]
 
         init_frames += partial_video_length - config.overlap_video_length
         last_frames = init_frames + partial_video_length
 
+        # Aggressive cleanup between chunks
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+
     # Save generated video
     video_path = os.path.join(save_path, f"{timestamp}.mp4")
     video_audio_path = os.path.join(save_path, f"{timestamp}_audio.mp4")
 
-    print ("final sample shape:",sample.shape)
+    print("final sample shape:", sample.shape)
     video_length = sample.shape[2]
-    print ("final length:",video_length)
+    print("final length:", video_length)
 
     save_videos_grid(sample[:, :, :video_length], video_path, fps=config.fps)
 
     video_clip = VideoFileClip(video_path)
-    audio_clip = audio_clip.subclipped(0, video_length / config.fps)
-    video_clip = video_clip.with_audio(audio_clip)
-    video_clip.write_videofile(video_audio_path, codec="libx264", audio_codec="aac", threads=2)
+    audio_clip_trimmed = audio_clip.subclipped(0, video_length / config.fps)
+    video_clip = video_clip.with_audio(audio_clip_trimmed)
+    video_clip.write_videofile(
+        video_audio_path, codec="libx264", audio_codec="aac", threads=2
+    )
 
     gc.collect()
     if torch.cuda.is_available():
@@ -396,49 +537,93 @@ def generate(
 
 
 with gr.Blocks(theme=gr.themes.Base()) as demo:
-    gr.Markdown("""
+    gr.Markdown(
+        """
             <div>
-                <h2 style="font-size: 30px;text-align: center;">EchoMimicV3</h2>
+                <h2 style="font-size: 30px;text-align: center;">EchoMimic V3</h2>
             </div>
-            """)
-    with gr.TabItem("EchoMimicV3"):
+            """
+    )
+    with gr.TabItem("EchoMimic V3"):
         with gr.Row():
             with gr.Column():
-                image = gr.Image(label="上传图片", type="filepath", height=400)
-                audio = gr.Audio(label="上传音频", type="filepath")
-                prompt = gr.Textbox(label="提示词", value="")
-                negative_prompt = gr.Textbox(label="负面提示词", value="Gesture is bad. Gesture is unclear. Strange and twisted hands. Bad hands. Bad fingers. Unclear and blurry hands. 手部快速摆动, 手指频繁抽搐, 夸张手势, 重复机械性动作.")
-                partial_video_length = gr.Slider(label="分段长度", info="24G显存推荐113，16G显存推荐81，12G显存推荐49", minimum=49, maximum=161, step=16, value=113)
-                guidance_scale = gr.Slider(label="guidance scale", info="修改分段长度后调整，推荐范围3.0~6.0", minimum=1.0, maximum=10.0, step=0.1, value=4.5)
-                audio_guidance_scale = gr.Slider(label="audio guidance scale", info="修改分段长度后调整，推荐范围2.0~3.0", minimum=1.0, maximum=10.0, step=0.1, value=2.5)
-                seed_param = gr.Number(label="种子，请输入正整数，-1为随机", value=43)
-                generate_button = gr.Button("🎬 开始生成", variant='primary')
+                image = gr.Image(
+                    label="Upload Image", type="filepath", height=400
+                )
+                audio = gr.Audio(
+                    label="Upload Audio", type="filepath"
+                )
+                prompt = gr.Textbox(label="Prompt", value="")
+                negative_prompt = gr.Textbox(
+                    label="Negative Prompt",
+                    value=(
+                        "Gesture is bad. Gesture is unclear. Strange and twisted hands. "
+                        "Bad hands. Bad fingers. Unclear and blurry hands. "
+                        "Fast random hand movement. Finger twitching. Exaggerated gestures. "
+                        "Repetitive mechanical motions."
+                    ),
+                )
+                partial_video_length = gr.Slider(
+                    label="Segment Length",
+                    info=(
+                        "Recommended: 113 for 24GB VRAM, 81 for 16GB VRAM, 49 for 12GB VRAM."
+                    ),
+                    minimum=49,
+                    maximum=161,
+                    step=16,
+                    value=113,
+                )
+                guidance_scale = gr.Slider(
+                    label="Guidance Scale",
+                    info="Adjust after changing segment length. Recommended range: 3.0–6.0",
+                    minimum=1.0,
+                    maximum=10.0,
+                    step=0.1,
+                    value=4.5,
+                )
+                audio_guidance_scale = gr.Slider(
+                    label="Audio Guidance Scale",
+                    info="Adjust after changing segment length. Recommended range: 2.0–3.0",
+                    minimum=1.0,
+                    maximum=10.0,
+                    step=0.1,
+                    value=2.5,
+                )
+                seed_param = gr.Number(
+                    label="Seed (enter positive integer; -1 for random)",
+                    value=43,
+                )
+                generate_button = gr.Button(
+                    "🎬 Start Generation", variant="primary"
+                )
             with gr.Column():
-                video_output = gr.Video(label="生成结果", interactive=False)
-                seed_output = gr.Textbox(label="种子")
+                video_output = gr.Video(
+                    label="Generated Video", interactive=False
+                )
+                seed_output = gr.Textbox(label="Seed Used")
 
         gr.on(
-        triggers=[generate_button.click, prompt.submit, negative_prompt.submit],
-        fn = generate,
-        inputs = [
-            image,
-            audio,
-            prompt,
-            negative_prompt,
-            partial_video_length,
-            guidance_scale,
-            audio_guidance_scale,
-            seed_param,
-        ],
-        outputs = [video_output, seed_output]
-    )
-        
+            triggers=[generate_button.click, prompt.submit, negative_prompt.submit],
+            fn=generate,
+            inputs=[
+                image,
+                audio,
+                prompt,
+                negative_prompt,
+                partial_video_length,
+                guidance_scale,
+                audio_guidance_scale,
+                seed_param,
+            ],
+            outputs=[video_output, seed_output],
+        )
 
-if __name__ == "__main__": 
+
+if __name__ == "__main__":
     demo.launch(
-        server_name=args.server_name, 
+        server_name=args.server_name,
         server_port=args.server_port,
-        share=args.share, 
+        share=args.share,
         mcp_server=args.mcp_server,
         inbrowser=True,
     )
