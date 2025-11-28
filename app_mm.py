@@ -310,12 +310,12 @@ budgets = int(
 ) if torch.cuda.is_available() else 0
 if torch.cuda.is_available():
     print(f"Automatically setting maximum VRAM budget to {budgets} MB")
-    offload.profile(
-        pipeline,
-        profile_type.LowRAM_HighVRAM,
-        budgets={"*": budgets},
-        compile=True if args.compile else False,
-    )
+    # offload.profile(
+    #     pipeline,
+    #     profile_type.LowRAM_HighVRAM,
+    #     budgets={"*": budgets},
+    #     compile=True if args.compile else False,
+    # )
 
 # Enable TeaCache if required
 if config.enable_teacache:
