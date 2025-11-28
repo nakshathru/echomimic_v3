@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer, Wav2Vec2Model, Wav2Vec2Processor
-from moviepy import VideoFileClip, AudioFileClip
+from moviepy.editor import VideoFileClip, AudioFileClip
 import librosa
 
 # Hint to CUDA allocator to reduce fragmentation and allow expansion
