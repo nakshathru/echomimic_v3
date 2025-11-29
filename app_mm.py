@@ -10,6 +10,9 @@ import math
 import datetime
 from functools import partial
 
+# Hint to CUDA allocator to reduce fragmentation and allow expansion
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import numpy as np
 import torch
 from PIL import Image
@@ -18,8 +21,8 @@ from transformers import AutoTokenizer, Wav2Vec2Model, Wav2Vec2Processor
 from moviepy.editor import VideoFileClip, AudioFileClip
 import librosa
 
-# Hint to CUDA allocator to reduce fragmentation and allow expansion
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+
 
 # Custom modules
 from diffusers import FlowMatchEulerDiscreteScheduler
@@ -60,7 +63,7 @@ parser.add_argument("--mcp_server", action="store_true",
 parser.add_argument(
     "--max_vram",
     type=float,
-    default=0.9,
+    default=0.6,
     help="Maximum fraction of GPU VRAM to use (0.0–1.0)",
 )
 parser.add_argument("--compile", action="store_true",
